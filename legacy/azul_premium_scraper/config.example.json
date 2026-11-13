@@ -1,0 +1,24 @@
+{
+  "output_dir": "output",
+  "empresas": [
+    {
+      "nome": "Azul Premium",
+      "url": "https://azulpremium.com.br/Veiculos",
+      "parser": "azul",
+      "min_model_stock": 4
+    },
+    {
+      "nome": "Grupo Hazul",
+      "url": "https://www.grupohazul.com.br/divem-citroen-seminovos/estoque/seminovos",
+      "parser": "hazul",
+      "min_model_stock": 3
+    },
+    {
+      "nome": "Avance Premium",
+      "url": "https://avancepremium.com.br/estoque/",
+      "parser": "playwright",
+      "load_more": true,
+      "min_model_stock": 3
+    }
+  ]
+}

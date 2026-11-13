@@ -1,0 +1,187 @@
+name: monitor-automotivo
+
+# Somente o frontend publica porta. MongoDB, Redis, API, worker e scheduler ficam na
+# rede interna "backend". A API é acessada pelo proxy do frontend em /api.
+
+x-app-env: &app-env
+  APP_ENV: ${APP_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  SECRET_KEY: ${SECRET_KEY:?Defina SECRET_KEY no .env}
+  MONGO_URI: mongodb://${MONGO_APP_USER:?Defina MONGO_APP_USER}:${MONGO_APP_PASSWORD:?Defina MONGO_APP_PASSWORD}@mongo:27017/${MONGO_DB:-monitor_automotivo}?authSource=${MONGO_DB:-monitor_automotivo}
+  MONGO_DB: ${MONGO_DB:-monitor_automotivo}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?Defina REDIS_PASSWORD}@redis:6379/0
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-480}
+  SCRAPER_TIMEOUT_SECONDS: ${SCRAPER_TIMEOUT_SECONDS:-30}
+  SCRAPER_MAX_PAGES: ${SCRAPER_MAX_PAGES:-30}
+  INVENTORY_MIN_RATIO: ${INVENTORY_MIN_RATIO:-0.5}
+  PLAYWRIGHT_ENABLED: ${PLAYWRIGHT_ENABLED:-true}
+  INSTAGRAM_PROVIDER: ${INSTAGRAM_PROVIDER:-instaloader}
+  INSTAGRAM_SESSION_FILE: ${INSTAGRAM_SESSION_FILE:-}
+  INSTAGRAM_SESSION_USERNAME: ${INSTAGRAM_SESSION_USERNAME:-}
+  INSTAGRAM_POSTS_LIMIT: ${INSTAGRAM_POSTS_LIMIT:-24}
+  INSTAGRAM_RATE_LIMIT: ${INSTAGRAM_RATE_LIMIT:-2/m}
+  INSTAGRAM_BLOCK_MINUTES: ${INSTAGRAM_BLOCK_MINUTES:-60}
+  INSTAGRAM_FOLLOWERS_TOLERANCE_DAYS: ${INSTAGRAM_FOLLOWERS_TOLERANCE_DAYS:-3}
+  INSTAGRAM_MIN_FREQUENCY_HOURS: ${INSTAGRAM_MIN_FREQUENCY_HOURS:-6}
+  TASK_MAX_RETRIES: ${TASK_MAX_RETRIES:-3}
+  TASK_RETRY_BACKOFF_SECONDS: ${TASK_RETRY_BACKOFF_SECONDS:-60}
+  RUN_LEASE_MINUTES: ${RUN_LEASE_MINUTES:-45}
+  SCHEDULER_TICK_SECONDS: ${SCHEDULER_TICK_SECONDS:-60}
+
+services:
+  mongo:
+    image: mongo:8.0.15
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?Defina MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Defina MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-monitor_automotivo}
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      MONGO_APP_DB: ${MONGO_DB:-monitor_automotivo}
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+      - ./infra/mongo-init:/docker-entrypoint-initdb.d:ro
+      - ./backups:/backups
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:7.4.6-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --save 60 1000"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Defina REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Etapa explícita e única de criação de índices/migrações.
+  init:
+    build: { context: ./backend, target: app }
+    image: monitor-automotivo-app:latest
+    command: ["python", "-m", "app.cli.migrate"]
+    environment: *app-env
+    depends_on:
+      mongo: { condition: service_healthy }
+    networks: [backend]
+    restart: "no"
+
+  api:
+    image: monitor-automotivo-app:latest
+    build: { context: ./backend, target: app }
+    restart: unless-stopped
+    init: true
+    environment: *app-env
+    depends_on:
+      init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 20s
+    stop_grace_period: 25s
+
+  worker:
+    build: { context: ./backend, target: worker }
+    image: monitor-automotivo-worker:latest
+    restart: unless-stopped
+    init: true
+    environment: *app-env
+    shm_size: 1gb
+    volumes:
+      - ./secrets/instagram:/run/secrets/instagram:ro
+    depends_on:
+      init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    # "public" dá saída à internet para a coleta (nenhuma porta publicada).
+    networks: [backend, public]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.worker.celery_app:celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 | grep -q pong"]
+      interval: 60s
+      timeout: 20s
+      retries: 5
+      start_period: 40s
+    stop_grace_period: 90s   # warm shutdown: termina a tarefa atual
+
+  # Uma única instância de agendador (Celery Beat).
+  scheduler:
+    image: monitor-automotivo-app:latest
+    build: { context: ./backend, target: app }
+    restart: unless-stopped
+    init: true
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/beat/schedule", "--pidfile="]
+    environment: *app-env
+    tmpfs: ["/tmp/beat:uid=10001,gid=10001"]
+    depends_on:
+      init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time,redis; t=redis.Redis.from_url(os.environ['REDIS_URL'], socket_timeout=3).get('scheduler:last_tick'); sys.exit(0 if t and time.time()-int(t) < 300 else 1)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 15s
+
+  frontend:
+    build: { context: ./frontend }
+    image: monitor-automotivo-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [backend, public]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Testes automatizados (perfil opcional): docker compose --profile test run --rm tests
+  mongo-test:
+    profiles: ["test"]
+    image: mongo:8.0.15
+    tmpfs: ["/data/db"]
+    networks: [testnet]
+
+  tests:
+    profiles: ["test"]
+    build: { context: ./backend, target: test }
+    environment:
+      SECRET_KEY: test-secret-key-only-for-automated-tests-000
+      MONGO_URI: mongodb://mongo-test:27017
+      REDIS_URL: redis://localhost:1/0
+      TEST_MONGO_URI: mongodb://mongo-test:27017
+    depends_on: [mongo-test]
+    networks: [testnet]
+
+networks:
+  backend:
+    internal: true
+  public: {}
+  testnet:
+    internal: true
+
+volumes:
+  mongo_data:
+  mongo_config:
+  redis_data:

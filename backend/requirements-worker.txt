@@ -1,0 +1,2 @@
+# Dependências adicionais apenas do worker (navegador headless).
+playwright==1.64.1
